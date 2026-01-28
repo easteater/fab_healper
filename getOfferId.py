@@ -3,14 +3,11 @@ import os
 import re
 from datetime import datetime
 from curl_cffi import requests
+from db import db  # 确保 db.py 在同一路径
 
 # ================= 配置区 =================
 CURL_FILE = "curl.txt"
-SOURCE_FILE = "unacquired.txt"  # 之前的未入库 UID 列表
-OUTPUT_FILE = "offerIds.txt"    # 格式: uid,offerId
-LOG_FILE = "get_offer_log.txt"
-
-DELAY = 1.5  # 增加一点点延迟，保护 IP 不被详情页反爬策略盯上
+DELAY = 1.8  # 详情页有 WAF 监控，建议维持在 1.5s - 2.0s
 # ==========================================
 
 def extract_val(source, key):
@@ -40,84 +37,82 @@ def get_auth_headers():
     
     return {
         'cookie': f'fab_csrftoken={c_csrf}; fab_sessionid={s_id}; cf_clearance={cf_clear};',
-        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'referer': 'https://www.fab.com/zh-cn/search'
+        'referer': 'https://www.fab.com/zh-cn/search?is_free=1'
     }
 
-def get_offer_ids():
+def start_parsing():
     headers = get_auth_headers()
     if not headers:
-        print("[!] 权限初始化失败，请检查 curl.txt")
+        print("[!] 权限解析失败，请检查 curl.txt")
         return
 
-    if not os.path.exists(SOURCE_FILE):
-        print(f"[!] 找不到源文件: {SOURCE_FILE}")
+    # 1. 核心查询：只查未入库的记录 (is_acquired = 0)，不管 offer_id 是否有值
+    with db._get_conn() as conn:
+        cursor = conn.execute('''
+            SELECT fab_uid FROM fab_assets 
+            WHERE is_acquired = 0
+        ''')
+        pending_items = [row[0] for row in cursor.fetchall()]
+
+    if not pending_items:
+        print("[*] 数据库中没有待处理的未入库资产。")
         return
 
-    # 1. 加载所有需要处理的 UID
-    with open(SOURCE_FILE, "r") as f:
-        target_uids = [line.strip() for line in f if line.strip()]
-
-    # 2. 加载已经处理过的 UID (用于断点续爬/去重)
-    processed_uids = set()
-    if os.path.exists(OUTPUT_FILE):
-        with open(OUTPUT_FILE, 'r') as f:
-            for line in f:
-                if ',' in line:
-                    processed_uids.add(line.split(',')[0].strip())
-
-    print(f"[*] 准备解析 {len(target_uids)} 个 UID。已跳过 {len(processed_uids)} 个已处理项。")
+    print(f"[*] 准备解析 {len(pending_items)} 个资产的 OfferID...")
     
     session = requests.Session()
-    total_found = 0
+    success_count = 0
 
-    for idx, uid in enumerate(target_uids):
-        # 跳过已存在的
-        if uid in processed_uids:
-            continue
-
+    for idx, uid in enumerate(pending_items):
         url = f"https://www.fab.com/zh-cn/listings/{uid}"
         
         try:
-            # impersonate 关键，详情页对指纹检查更严
+            # 使用 chrome120 强力模拟，防止详情页 403
             resp = session.get(url, headers=headers, impersonate="chrome120", timeout=30)
             
             if resp.status_code == 200:
-                # 匹配 32 位十六进制 offerId
-                found = re.findall(r'offerId["\']?\s*[:=]\s*["\']([a-f0-9]{32})["\']', resp.text)
+                # 匹配 32 位 hex 格式的 offerId
+                found_oids = re.findall(r'offerId["\']?\s*[:=]\s*["\']([a-f0-9]{32})', resp.text)
                 
-                if found:
-                    # 一个 UID 页面可能存在多个 OfferID，全部存下来，后续下单一一尝试
-                    unique_offers = list(set(found))
-                    with open(OUTPUT_FILE, 'a') as f:
-                        for oid in unique_offers:
-                            f.write(f"{uid},{oid}\n")
+                if found_oids:
+                    # 去重并保持顺序 (dict.fromkeys 是 Python 3.7+ 的去重黑科技)
+                    unique_oids = list(dict.fromkeys(found_oids))
+                    oid1 = unique_oids[0]
+                    oid2 = unique_oids[1] if len(unique_oids) > 1 else None
                     
-                    total_found += len(unique_offers)
-                    status = f"FOUND({len(unique_offers)})"
+                    # 关键：更新两个字段。如果 oid2 为 None，DB 对应字段会存入 NULL
+                    db.update_asset(uid, 
+                                   offer_id_1=oid1, 
+                                   offer_id_2=oid2, 
+                                   last_error=None)
+                    
+                    status_str = f"SUCCESS (OIDs: {len(unique_oids)})"
+                    success_count += 1
                 else:
-                    status = "NOT_FOUND"
-                    # 可选：记录没找到的 UID 到日志
-                    with open(LOG_FILE, 'a') as log:
-                        log.write(f"{datetime.now()} | {uid} | NO_OFFER_FOUND\n")
+                    status_str = "FAILED (No ID Found)"
+                    db.update_asset(uid, last_error="OfferID not found in HTML content")
             
             elif resp.status_code == 403:
-                print(f"\n[!] 403 Forbidden. 盾拦截。请重新获取 curl.txt 并刷新 cf_clearance。")
+                print(f"\n[!] 403 Forbidden. 详情页盾厚，请去浏览器点击过盾并更新 curl.txt")
                 break
             else:
-                status = f"HTTP_{resp.status_code}"
+                status_str = f"HTTP_{resp.status_code}"
+                db.update_asset(uid, last_error=f"HTTP Status {resp.status_code}")
 
-            print(f"[*] [{idx+1}/{len(target_uids)}] UID: {uid[:8]}... -> {status} | Total OIDs: {total_found}", end='\r')
+            print(f"[*] [{idx+1}/{len(pending_items)}] UID: {uid[:8]}... -> {status_str}", end='\r')
 
         except Exception as e:
-            print(f"\n[!] 异常 UID {uid}: {e}")
+            error_msg = str(e)[:50]
+            print(f"\n[!] 异常 (UID: {uid}): {error_msg}")
+            db.update_asset(uid, last_error=error_msg)
             time.sleep(5)
             continue
         
         time.sleep(DELAY)
 
-    print(f"\n\n[*] 任务完成。映射关系已存入: {OUTPUT_FILE}")
+    print(f"\n\n[*] 任务结束。本次成功解析并回填: {success_count} 条")
 
 if __name__ == "__main__":
-    get_offer_ids()
+    start_parsing()

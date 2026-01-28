@@ -2,13 +2,12 @@ import time
 import os
 from datetime import datetime
 from curl_cffi import requests
+from db import db 
 
-# ================= Configuration =================
+# ================= 配置区 =================
 CURL_FILE = "curl.txt"
-SOURCE_FILE = "offerIds.txt" 
-LOG_FILE = "claim_final_result.log"
-DELAY = 2.5 
-# =================================================
+DELAY = 2.5  # 下单请求间隔
+# ==========================================
 
 def extract_val(source, key):
     if key not in source: return None
@@ -37,11 +36,10 @@ def get_auth_config():
     
     if not s_id or not c_csrf: return None
 
-    # 这里我们必须手动指定 Content-Type，因为我们要手动拼 boundary
     return {
         'cookie': f'fab_csrftoken={c_csrf}; fab_sessionid={s_id}; cf_clearance={cf_clear};',
         'x-csrftoken': c_csrf,
-        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'accept': 'application/json, text/plain, */*',
         'content-type': 'multipart/form-data; boundary=----WebKitFormBoundaryl229K9g1SIGFRADA',
         'origin': 'https://www.fab.com',
@@ -51,87 +49,67 @@ def get_auth_config():
 def start_claiming():
     auth = get_auth_config()
     if not auth:
-        print("[!] 权限解析失败")
+        print("[!] 权限初始化失败")
         return
 
-    if not os.path.exists(SOURCE_FILE):
-        print(f"[!] 找不到文件: {SOURCE_FILE}")
+    # 1. 查找所有未购买且至少有一个 OfferID 的记录
+    with db._get_conn() as conn:
+        cursor = conn.execute('''
+            SELECT fab_uid, offer_id_1, offer_id_2, retry_count 
+            FROM fab_assets 
+            WHERE is_acquired = 0 AND (offer_id_1 IS NOT NULL OR offer_id_2 IS NOT NULL)
+        ''')
+        pending_assets = cursor.fetchall()
+
+    if not pending_assets:
+        print("[*] 库中无待处理资产。")
         return
 
-    with open(SOURCE_FILE, "r") as f:
-        lines = [l.strip() for l in f if l.strip()]
-
-    processed_offers = set()
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'r') as f:
-            for l in f:
-                if "SUCCESS" in l:
-                    parts = l.split('|')
-                    if len(parts) > 2:
-                        processed_offers.add(parts[2].strip())
-
-    print(f"[*] 准备下单 {len(lines)} 个资源...")
+    print(f"[*] 准备处理 {len(pending_assets)} 个资源 (支持双 Offer 下单)...")
     
     session = requests.Session()
-    success_count = 0
 
-    for idx, line in enumerate(lines):
-        if ',' not in line: continue
-        uid, offer_id = [x.strip() for x in line.split(',')]
+    for idx, (uid, oid1, oid2, retries) in enumerate(pending_assets):
+        # 将非空的 OfferID 放入待处理列表
+        offers_to_claim = []
+        if oid1: offers_to_claim.append(oid1)
+        if oid2: offers_to_claim.append(oid2)
 
-        if offer_id in processed_offers:
-            continue
-
-        api_url = f"https://www.fab.com/i/listings/{uid}/add-to-library"
-        
-        # 核心改动：完全模拟你 curl 里的原始数据结构
-        # 使用你提供的那个固定 boundary
-        raw_data = (
-            f"------WebKitFormBoundaryl229K9g1SIGFRADA\r\n"
-            f"Content-Disposition: form-data; name=\"offer_id\"\r\n\r\n"
-            f"{offer_id}\r\n"
-            f"------WebKitFormBoundaryl229K9g1SIGFRADA--\r\n"
-        )
-        
-        headers = auth.copy()
-        headers['referer'] = f"https://www.fab.com/zh-cn/listings/{uid}"
-
-        try:
-            # 使用 data 发送原始字节流数据
-            resp = session.post(
-                api_url, 
-                headers=headers, 
-                data=raw_data.encode('utf-8'), 
-                impersonate="chrome120", 
-                timeout=30
+        for sub_idx, offer_id in enumerate(offers_to_claim):
+            api_url = f"https://www.fab.com/i/listings/{uid}/add-to-library"
+            raw_data = (
+                f"------WebKitFormBoundaryl229K9g1SIGFRADA\r\n"
+                f"Content-Disposition: form-data; name=\"offer_id\"\r\n\r\n"
+                f"{offer_id}\r\n"
+                f"------WebKitFormBoundaryl229K9g1SIGFRADA--\r\n"
             )
-
-            ts = datetime.now().strftime('%H:%M:%S')
             
-            if resp.status_code in [200, 201]:
-                if '"success":true' in resp.text.lower() or '"id"' in resp.text.lower():
-                    status = "SUCCESS"
-                    success_count += 1
+            headers = auth.copy()
+            headers['referer'] = f"https://www.fab.com/zh-cn/listings/{uid}"
+
+            try:
+                resp = session.post(api_url, headers=headers, data=raw_data.encode('utf-8'), impersonate="chrome120", timeout=30)
+                
+                res_text = resp.text.lower()
+                if resp.status_code in [200, 201] and ('"success":true' in res_text or '"id"' in res_text):
+                    status = f"SUCCESS (Offer {sub_idx+1})"
+                elif resp.status_code == 403:
+                    print(f"\n[!] 403 Forbidden. 停止运行。")
+                    return
                 else:
-                    status = f"FAILED_MSG: {resp.text[:50]}"
-            elif resp.status_code == 403:
-                print(f"\n[!] 403 Forbidden. 可能是 cf_clearance 到期了。")
-                break
-            else:
-                status = f"HTTP_{resp.status_code}"
+                    status = f"FAIL (Offer {sub_idx+1}) - {resp.status_code}"
+                    db.update_asset(uid, retry_count=(retries or 0)+1, last_error=f"Offer{sub_idx+1}_Fail_{resp.status_code}")
 
-            print(f"[*] [{idx+1}/{len(lines)}] UID: {uid[:8]}... -> {status}", end='\r')
+                print(f"[*] [{idx+1}/{len(pending_assets)}] UID: {uid[:8]}... -> {status}", end='\r')
 
-            with open(LOG_FILE, 'a') as f:
-                f.write(f"{ts} | {uid} | {offer_id} | {status}\n")
+            except Exception as e:
+                print(f"\n[!] 异常: {e}")
+                return
+            
+            # 同一个 UID 的两个 Offer 之间也稍微停顿下
+            time.sleep(DELAY)
 
-        except Exception as e:
-            print(f"\n[!] 异常退出 (UID: {uid}): {e}")
-            break
-
-        time.sleep(DELAY)
-
-    print(f"\n\n[*] 任务结束。成功入库: {success_count}")
+    print(f"\n\n[*] 下单批次结束。请运行 compare.py 确认最终状态。")
 
 if __name__ == "__main__":
     start_claiming()
